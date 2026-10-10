@@ -1,0 +1,1414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多智能体协作可视化 · RAG + ReAct + Multi-Agent</title>
+<!--
+  ============================================================================
+  多智能体协作可视化前端
+  ============================================================================
+  【这个文件的组织方式】
+     纯原生 HTML/CSS/JS，不引入任何框架和 CDN 依赖。
+     原因：
+       1. 离线可用 —— 没有网络也能跑（这是本项目的核心约束）
+       2. 学习友好 —— 你能看到每一行在做什么，
+          而不是被 React/Vue 的抽象层挡住
+       3. 零构建 —— 改完刷新即可，不需要 npm/webpack
+
+     【代价】代码比用框架长一些，状态管理要手写。
+     但对于一个教学项目，看清实现过程比代码简洁更重要。
+
+  【结构】
+     <style>   —— 全部样式（含深色主题、各面板布局）
+     <body>    —— 五个面板的静态骨架
+     <script>  —— 全部逻辑，按功能分区：
+                    1. 状态与工具函数
+                    2. SSE 连接与事件分发
+                    3. 各面板渲染器
+                    4. 交互绑定
+  ============================================================================
+-->
+<style>
+/* ==========================================================================
+   设计变量
+   【为什么用 CSS 变量？】主题色、间距在多处复用，
+   写死在各处会导致改一个颜色要搜遍全文，且容易漏改。
+   变量集中定义，一处修改全局生效。
+   ========================================================================== */
+:root {
+  --bg:        #0d1117;
+  --bg-panel:  #161b22;
+  --bg-raise:  #1c2128;
+  --bg-hover:  #21262d;
+  --border:    #30363d;
+  --border-lt: #3d444d;
+
+  --fg:        #e6edf3;
+  --fg-dim:    #8b949e;
+  --fg-faint:  #6e7681;
+
+  /* 每个 Agent 一个专属颜色。
+     【为什么要区分颜色？】时间线上四条泳道并行，
+     颜色是最快的识别手段 —— 你一眼就能看出"这段是分析师在干活"。
+     比读文字标签快得多。 */
+  --c-orch:  #a371f7;   /* 协调者 - 紫 */
+  --c-res:   #58a6ff;   /* 调研员 - 蓝 */
+  --c-ana:   #3fb950;   /* 分析师 - 绿 */
+  --c-wri:   #d29922;   /* 撰写者 - 黄 */
+  --c-cri:   #f85149;   /* 审校者 - 红 */
+  --c-rag:   #39c5cf;   /* RAG    - 青 */
+  --c-tool:  #db6d28;   /* 工具   - 橙 */
+
+  --radius: 8px;
+  --mono: "Cascadia Code", "Consolas", "SF Mono", Menlo, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;   /* 各面板自己滚动，body 不滚 */
+}
+
+/* ============================ 顶栏 ============================ */
+header {
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 18px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+h1 { font-size: 15px; font-weight: 600; white-space: nowrap; }
+h1 span { color: var(--fg-faint); font-weight: 400; font-size: 12px; }
+
+.cfg-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 2px 10px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+.chip b { color: var(--fg); font-weight: 600; }
+
+.spacer { flex: 1; }
+
+/* ============================ 按钮 ============================ */
+button {
+  background: #238636;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background .15s;
+  white-space: nowrap;
+}
+button:hover:not(:disabled) { background: #2ea043; }
+button:disabled { background: #21262d; color: var(--fg-faint); cursor: not-allowed; }
+button.ghost { background: transparent; border: 1px solid var(--border-lt); color: var(--fg-dim); }
+button.ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--fg); }
+button.sm { padding: 3px 10px; font-size: 12px; font-weight: 500; }
+
+/* ============================ 问题输入 ============================ */
+.query-row {
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 18px;
+  display: flex;
+  gap: 10px;
+  flex-shrink: 0;
+  align-items: flex-start;
+}
+textarea {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 40px;
+  max-height: 120px;
+  line-height: 1.5;
+}
+textarea:focus { outline: none; border-color: var(--c-res); }
+
+/* ============================ 主区域 ============================ */
+main { flex: 1; display: flex; overflow: hidden; }
+
+.col { display: flex; flex-direction: column; overflow: hidden; }
+.col-left  { width: 42%; border-right: 1px solid var(--border); }
+.col-mid   { width: 30%; border-right: 1px solid var(--border); }
+.col-right { flex: 1; }
+
+/* 面板 */
+.panel { display: flex; flex-direction: column; overflow: hidden; }
+.panel-head {
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+}
+.panel-head .count {
+  background: var(--bg-raise);
+  border-radius: 10px;
+  padding: 0 7px;
+  font-size: 11px;
+  color: var(--fg-faint);
+  font-family: var(--mono);
+}
+.panel-body { flex: 1; overflow-y: auto; padding: 10px 14px; }
+
+/* 滚动条美化 */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+/* ============================ 时间线 ============================ */
+.tl-item {
+  border-left: 3px solid var(--border);
+  padding: 6px 0 6px 11px;
+  margin-bottom: 3px;
+  animation: slideIn .25s ease-out;
+}
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.tl-item.a-orchestrator { border-color: var(--c-orch); }
+.tl-item.a-researcher   { border-color: var(--c-res); }
+.tl-item.a-analyst      { border-color: var(--c-ana); }
+.tl-item.a-writer       { border-color: var(--c-wri); }
+.tl-item.a-critic       { border-color: var(--c-cri); }
+.tl-item.a-rag          { border-color: var(--c-rag); }
+.tl-item.a-system       { border-color: var(--fg-faint); }
+
+.tl-top { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.tl-agent {
+  font-weight: 700;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-raise);
+}
+.a-orchestrator .tl-agent { color: var(--c-orch); }
+.a-researcher   .tl-agent { color: var(--c-res); }
+.a-analyst      .tl-agent { color: var(--c-ana); }
+.a-writer       .tl-agent { color: var(--c-wri); }
+.a-critic       .tl-agent { color: var(--c-cri); }
+.a-rag          .tl-agent { color: var(--c-rag); }
+.a-system       .tl-agent { color: var(--fg-faint); }
+
+.tl-phase {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  font-weight: 600;
+}
+.ph-thought     { background: #1f2937; color: #93c5fd; }
+.ph-action      { background: #3b2a12; color: #fbbf24; }
+.ph-observation { background: #14311f; color: #6ee7a8; }
+.ph-final       { background: #2a1f3d; color: #c4b5fd; }
+.ph-event       { background: #26262b; color: var(--fg-dim); }
+.ph-message     { background: #1a2b3a; color: #7dd3fc; }
+.ph-rag         { background: #12333a; color: var(--c-rag); }
+
+/* 返工循环的视觉标记 —— 让"打回重做"一眼可见 */
+.tl-round {
+  margin: 12px 0 7px;
+  padding: 5px 12px;
+  background: linear-gradient(90deg, #2a1f3d, transparent);
+  border-left: 3px solid var(--c-orch);
+  font-size: 12px;
+  font-weight: 700;
+  color: #c4b5fd;
+  border-radius: 0 5px 5px 0;
+}
+.tl-round.revise { background: linear-gradient(90deg, #3d1f1f, transparent); border-color: var(--c-cri); color: #fca5a5; }
+.tl-round.pass   { background: linear-gradient(90deg, #14311f, transparent); border-color: var(--c-ana); color: #86efac; }
+
+.tl-content {
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  margin-top: 3px;
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 4.6em;
+  overflow: hidden;
+  position: relative;
+  cursor: pointer;
+}
+.tl-content.expanded { max-height: none; }
+.tl-content:not(.expanded)::after {
+  content: "";
+  position: absolute; bottom: 0; left: 0; right: 0; height: 1.5em;
+  background: linear-gradient(transparent, var(--bg));
+}
+.tl-content.plain { font-family: inherit; color: var(--fg); }
+
+/* ============================ 黑板卡片 ============================ */
+.bb-card {
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 9px;
+  overflow: hidden;
+}
+.bb-head {
+  padding: 7px 11px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.bb-head:hover { background: var(--bg-hover); }
+.bb-slot { font-family: var(--mono); color: var(--c-rag); }
+.bb-ver {
+  background: #1f2937; color: #93c5fd;
+  font-size: 10px; padding: 0 6px; border-radius: 3px;
+  font-family: var(--mono);
+}
+.bb-by { color: var(--fg-faint); font-size: 11px; font-family: var(--mono); margin-left: auto; }
+.bb-body {
+  padding: 9px 11px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg-dim);
+  max-height: 340px;
+  overflow-y: auto;
+  display: none;
+}
+.bb-card.open .bb-body { display: block; }
+.bb-ver-list { border-top: 1px solid var(--border); }
+.bb-ver-item { padding: 6px 11px; border-bottom: 1px solid var(--border); font-size: 11px; }
+.bb-ver-item:last-child { border-bottom: none; }
+.bb-ver-tag { color: #93c5fd; font-family: var(--mono); font-weight: 700; }
+
+/* ============================ RAG 详情 ============================ */
+.rag-card {
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--c-rag);
+  border-radius: var(--radius);
+  margin-bottom: 9px;
+  overflow: hidden;
+}
+.rag-head { padding: 7px 11px; font-size: 12px; cursor: pointer; display: flex; gap: 8px; align-items: center; }
+.rag-head:hover { background: var(--bg-hover); }
+.rag-q { font-family: var(--mono); color: var(--c-rag); font-weight: 600; }
+.rag-body { padding: 0 11px 10px; display: none; }
+.rag-card.open .rag-body { display: block; }
+
+/* 检索漏斗的每一级 */
+.stage {
+  border-left: 2px solid var(--border);
+  padding: 5px 0 5px 10px;
+  margin: 7px 0;
+  font-size: 11.5px;
+}
+.stage-label { font-weight: 700; color: var(--fg); font-family: var(--mono); font-size: 11px; }
+.stage-desc { color: var(--fg-faint); font-size: 11px; }
+.stage-pass { color: #6ee7a8; }
+.stage-fail { color: #fca5a5; }
+
+/* 得分条 —— 把抽象的数字变成可视长度 */
+.bar-row { display: flex; align-items: center; gap: 6px; margin: 3px 0; font-size: 11px; }
+.bar-name { font-family: var(--mono); color: var(--fg-dim); width: 190px; flex-shrink: 0;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-track { flex: 1; height: 13px; background: var(--bg); border-radius: 3px; overflow: hidden;
+             display: flex; min-width: 40px; }
+.bar-fill { height: 100%; }
+.bar-bm25  { background: linear-gradient(90deg, #db6d28, #f0883e); }
+.bar-dense { background: linear-gradient(90deg, #1f6feb, #58a6ff); }
+.bar-val { font-family: var(--mono); color: var(--fg-faint); width: 92px; text-align: right; flex-shrink: 0; font-size: 10.5px; }
+
+.hit {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 5px; padding: 6px 9px; margin: 4px 0;
+}
+.hit-top { display: flex; gap: 7px; align-items: center; font-size: 11px; flex-wrap: wrap; }
+.hit-id { font-family: var(--mono); color: var(--c-rag); font-weight: 600; cursor: pointer; }
+.hit-id:hover { text-decoration: underline; }
+.hit-score { font-family: var(--mono); color: #6ee7a8; }
+.hit-prev { font-size: 11px; color: var(--fg-faint); margin-top: 3px; line-height: 1.45; }
+
+/* ============================ 报告 ============================ */
+.report { font-size: 13px; line-height: 1.75; }
+.report h1 { font-size: 18px; margin: 4px 0 12px; color: var(--fg); border-bottom: 1px solid var(--border); padding-bottom: 7px; }
+.report h2 { font-size: 15px; margin: 16px 0 7px; color: #c4b5fd; }
+.report h3 { font-size: 13.5px; margin: 12px 0 5px; color: var(--fg); }
+.report p  { margin: 6px 0; }
+.report ul, .report ol { margin: 6px 0 6px 22px; }
+.report li { margin: 3px 0; }
+.report code { background: var(--bg-raise); padding: 1px 5px; border-radius: 3px;
+               font-family: var(--mono); font-size: 12px; color: #79c0ff; }
+.report table { border-collapse: collapse; width: 100%; margin: 9px 0; font-size: 12px; }
+.report th, .report td { border: 1px solid var(--border); padding: 6px 9px; text-align: left; }
+.report th { background: var(--bg-raise); color: var(--fg); font-weight: 600; }
+.report td { color: var(--fg-dim); }
+.report strong { color: #ffa657; }
+
+/* 引用标记 —— 可点击溯源，这是防幻觉链条的人工核对入口 */
+.cite {
+  background: #12333a;
+  color: var(--c-rag);
+  border: 1px solid #1f5f68;
+  border-radius: 3px;
+  padding: 0 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cite:hover { background: #17444d; }
+.cite.invalid { background: #3d1f1f; color: #fca5a5; border-color: #7f2a2a; }
+.cite.invalid:hover { background: #4d2626; }
+
+/* ============================ 统计 ============================ */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(105px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.stat { background: var(--bg-raise); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; }
+.stat-k { font-size: 10px; color: var(--fg-faint); text-transform: uppercase; letter-spacing: .4px; }
+.stat-v { font-size: 19px; font-weight: 700; font-family: var(--mono); margin-top: 1px; }
+.stat-v.ok   { color: #6ee7a8; }
+.stat-v.warn { color: #fbbf24; }
+.stat-v.bad  { color: #fca5a5; }
+
+/* ============================ 角色卡片 ============================ */
+.agent-card {
+  background: var(--bg-raise); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px; margin-bottom: 7px;
+}
+.agent-name { font-weight: 700; font-size: 12.5px; font-family: var(--mono); display: flex; align-items: center; gap: 7px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.agent-tools { font-size: 11px; color: var(--fg-faint); font-family: var(--mono); margin-top: 4px; line-height: 1.6; }
+.tool-tag { background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
+            padding: 0 5px; margin-right: 4px; display: inline-block; color: var(--tool, #db6d28); }
+
+/* ============================ 弹窗 ============================ */
+.modal-mask {
+  position: fixed; inset: 0; background: rgba(0,0,0,.72);
+  display: none; align-items: center; justify-content: center; z-index: 100; padding: 30px;
+}
+.modal-mask.show { display: flex; }
+.modal {
+  background: var(--bg-panel); border: 1px solid var(--border-lt);
+  border-radius: 10px; max-width: 900px; width: 100%; max-height: 84vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.modal-head {
+  padding: 11px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 600;
+}
+.modal-body { padding: 14px 16px; overflow-y: auto; font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+.modal-body .meta { font-family: var(--mono); font-size: 11.5px; color: var(--fg-faint); margin-bottom: 10px; }
+
+/* ============================ 状态提示 ============================ */
+.empty { color: var(--fg-faint); font-size: 12.5px; text-align: center; padding: 26px 14px; line-height: 1.8; }
+.badge {
+  font-size: 10px; padding: 2px 7px; border-radius: 10px;
+  font-weight: 700; text-transform: uppercase; letter-spacing: .4px;
+}
+.badge.idle    { background: #21262d; color: var(--fg-faint); }
+.badge.running { background: #1f6feb; color: #fff; animation: pulse 1.4s infinite; }
+.badge.done    { background: #238636; color: #fff; }
+.badge.error   { background: #da3633; color: #fff; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+
+.err-box {
+  background: #3d1f1f; border: 1px solid #7f2a2a; color: #fca5a5;
+  border-radius: var(--radius); padding: 10px 12px; font-size: 12px;
+  font-family: var(--mono); white-space: pre-wrap; margin-bottom: 10px;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>多智能体协作可视化 <span>RAG + ReAct + Multi-Agent</span></h1>
+  <div class="cfg-chips" id="cfgChips"></div>
+  <div class="spacer"></div>
+  <span class="badge idle" id="statusBadge">待命</span>
+  <button class="ghost sm" id="btnClear">清空</button>
+</header>
+
+<div class="query-row">
+  <textarea id="queryInput" rows="2">我们是一个 5 人左右的小团队，想搭建一个中文企业知识库问答系统，没有专职运维人员，预算也比较有限。请问应该怎么选择向量数据库和相关技术方案？希望给出具体的选型建议和落地步骤。</textarea>
+  <button id="btnRun">▶ 开始协作</button>
+</div>
+
+<main>
+  <!-- ============ 左：协作时间线 + RAG 检索 ============ -->
+  <div class="col col-left">
+    <div class="panel" style="flex:1;">
+      <div class="panel-head">
+        协作时间线
+        <span class="count" id="tlCount">0</span>
+        <div class="spacer"></div>
+        <button class="ghost sm" id="btnFilterRag">隐藏检索细节</button>
+      </div>
+      <div class="panel-body" id="timeline">
+        <div class="empty">
+          点击「开始协作」运行<br>
+          <span style="font-size:11px;">每个 Thought / Action / Observation 都会实时出现在这里</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 中：黑板数据流 ============ -->
+  <div class="col col-mid">
+    <div class="panel" style="flex:1;">
+      <div class="panel-head">
+        黑板数据流
+        <span class="count" id="bbCount">0</span>
+      </div>
+      <div class="panel-body" id="blackboard">
+        <div class="empty">
+          协作开始后<br>这里显示数据如何在槽位间流动
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 右：最终报告 ============ -->
+  <div class="col col-right">
+    <div class="panel" style="flex:1;">
+      <div class="panel-head">
+        最终报告
+        <div class="spacer"></div>
+        <span class="count" id="reportMeta"></span>
+      </div>
+      <div class="panel-body" id="reportPane">
+        <div class="empty">
+          协作完成后<br>报告显示在这里<br>
+          <span style="font-size:11px;">点击报告里的 <code style="color:#39c5cf;">[文档#块号]</code> 可查看原文，验证引用真伪</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- ============ 弹窗（原文溯源 / 元信息） ============ -->
+<div class="modal-mask" id="modalMask">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="modalTitle">原文</span>
+      <div class="spacer"></div>
+      <button class="ghost sm" id="btnCloseModal">关闭</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<script>
+/* ============================================================================
+   一、全局状态与工具函数
+   ============================================================================ */
+
+// 所有 Agent 的名字与颜色（与 CSS 变量对应）
+const AGENTS = {
+  orchestrator: { label: "协调者", color: "var(--c-orch)" },
+  researcher:   { label: "调研员", color: "var(--c-res)"  },
+  analyst:      { label: "分析师", color: "var(--c-ana)"  },
+  writer:       { label: "撰写者", color: "var(--c-wri)"  },
+  critic:       { label: "审校者", color: "var(--c-cri)"  },
+  rag:          { label: "检索",   color: "var(--c-rag)"  },
+  system:       { label: "系统",   color: "var(--fg-faint)" },
+};
+
+// 【前端状态集中管理】
+// 为什么要集中？因为多个面板都要读这些数据，
+// 散落在各处的全局变量很快就会失控。
+const S = {
+  running: false,
+  tlCount: 0,
+  hideRag: false,
+  slots: {},          // 黑板快照
+  citations: new Set(),  // 全部有效引用 ID（用于判断报告里的引用是否有效）
+  currentRound: 0,    // 当前返工轮次，用于在时间线上插入分隔标记
+  report: "",
+};
+
+const $ = (id) => document.getElementById(id);
+
+// HTML 转义。
+// 【为什么必须转义？】Agent 的输出、工具返回的内容都会直接插进 innerHTML。
+// 如果内容里含 <script> 或 <img onerror=...>，
+// 就会被浏览器当成代码执行 —— 这就是 XSS 漏洞。
+// 虽然这里的数据源是我们自己的模型输出，看起来"可信"，
+// 但模型输出本质是【不可控的文本】，
+// 一旦模型生成了恶意内容（或被提示注入），就会中招。
+// 【凡是要插进 HTML 的动态文本，一律转义 —— 没有例外。】
+function esc(s) {
+  if (s === null || s === undefined) return "";
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString("zh-CN", { hour12: false }) + "." +
+         String(d.getMilliseconds()).padStart(3, "0");
+}
+
+/* ============================================================================
+   二、SSE 连接
+   ============================================================================
+   EventSource 是浏览器内置的 SSE 客户端。
+   它【会自动重连】—— 网络断了、服务重启了，它都会自己接回来。
+   这是 SSE 相比手写轮询的一大优势。
+   ============================================================================ */
+let es = null;
+
+function connect() {
+  if (es) es.close();
+  es = new EventSource("/api/stream");
+
+  es.onmessage = (ev) => {
+    let rec;
+    try {
+      rec = JSON.parse(ev.data);
+    } catch (e) {
+      // 【为什么要有这个 try？】服务端推送的内容如果格式不对，
+      // JSON.parse 会抛异常。一个异常就会让 onmessage 中断，
+      // 后续所有事件都处理不了 —— 界面看起来"卡住了"。
+      // 所以单条事件解析失败必须被隔离，不能影响整个流。
+      console.warn("无法解析事件，已跳过:", ev.data.slice(0, 120));
+      return;
+    }
+    handleEvent(rec);
+  };
+
+  es.onerror = () => {
+    // EventSource 会自动重连，这里只更新状态提示。
+    // 【不要在这里 close()】否则就失去了自动重连的能力。
+    if (S.running) {
+      console.warn("SSE 连接中断，浏览器将自动重连…");
+    }
+  };
+}
+
+/* ============================================================================
+   三、事件分发
+   ============================================================================
+   服务端推来的每条记录都有 kind 字段，我们按它分发到不同的处理函数。
+   这与后端 tracer 的三种记录类型一一对应：event / react / message
+   ============================================================================ */
+function handleEvent(rec) {
+  switch (rec.kind) {
+    case "connected":
+      console.log("已连接到服务端事件流");
+      break;
+
+    case "idle":
+      setStatus("done");
+      break;
+
+    case "react":
+      addReact(rec);
+      break;
+
+    case "message":
+      addMessage(rec);
+      break;
+
+    case "event":
+      handleMilestone(rec);
+      break;
+
+    case "rag":
+      addRag(rec);
+      break;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   里程碑事件
+   --------------------------------------------------------------------------- */
+function handleMilestone(rec) {
+  const ev = rec.event;
+
+  if (ev === "agent_start") {
+    // Agent 开始执行 —— 插入一条醒目的分隔线
+    insertRoundIfNeeded();
+    addTimeline({
+      agent: rec.agent,
+      phase: "event",
+      phaseLabel: "开始",
+      content: "▶ 开始执行" + (rec.round_no ? ` (第 ${rec.round_no} 轮)` : ""),
+      plain: true,
+    });
+  } else if (ev === "agent_end") {
+    addTimeline({
+      agent: rec.agent,
+      phase: "event",
+      phaseLabel: "结束",
+      content: `◀ 结束 · ${rec.steps} 步 / ${rec.tool_calls} 次工具调用 / ` +
+               `${rec.citations} 条引用 / ${rec.elapsed}s / 停止原因=${rec.stopped}`,
+      plain: true,
+    });
+  } else if (ev === "agents_ready") {
+    renderAgentCards(rec.agents);
+  } else if (ev === "pipeline_summary") {
+    renderSummary(rec);
+  } else if (ev === "blackboard_snapshot") {
+    renderBlackboard(rec.slots);
+  } else if (ev === "pipeline_start") {
+    setStatus("running");
+  } else if (ev === "error") {
+    addError(rec);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   返工轮次分隔
+   ---------------------------------------------------------------------------
+   【这是可视化最想表达的东西】
+   多智能体的价值就在于"审校打回、重新来过"这个循环。
+   但在纯文本日志里，这个循环很不明显 ——
+   你只会看到 writer 又运行了一次，不知道这是返工。
+   所以在每一轮开始时插入一条醒目的分隔标记。
+   --------------------------------------------------------------------------- */
+function insertRoundIfNeeded() {
+  const round = window.__pendingRound;
+  if (round === undefined || round === null) return;
+
+  if (round !== S.currentRound) {
+    S.currentRound = round;
+    const el = document.createElement("div");
+    el.className = "tl-round" + (round > 1 ? " revise" : "");
+    el.textContent = round > 1
+      ? `↻ 第 ${round} 轮：审校未通过 → 打回重做`
+      : `第 ${round} 轮：撰写 → 审校`;
+    $("timeline").appendChild(el);
+    $("timeline").scrollTop = $("timeline").scrollHeight;
+  }
+  window.__pendingRound = null;
+}
+
+/* ============================================================================
+   四、时间线渲染
+   ============================================================================ */
+function addReact(rec) {
+  // 是哪个 Agent 触发了这轮返工？记录轮次，等 agent_start 时插入分隔线
+  if (rec.extra && rec.extra.round_no) {
+    window.__pendingRound = rec.extra.round_no;
+  }
+
+  const PHASE_LABEL = {
+    thought: "思考", action: "行动", observation: "观察", final: "最终",
+  };
+
+  addTimeline({
+    agent: rec.agent,
+    phase: rec.phase,
+    phaseLabel: PHASE_LABEL[rec.phase] || rec.phase,
+    content: rec.content,
+    step: rec.step,
+  });
+}
+
+function addMessage(rec) {
+  const kindLabel = { task: "派活", result: "汇报", final: "完成",
+                      critique: "批评", revision: "返工" }[rec.msg_kind] || rec.msg_kind;
+
+  let content = `→ ${rec.recipient}`;
+  const p = rec.payload_summary;
+  if (p && typeof p === "object") {
+    if (p.goal) content += ` · ${p.goal}`;
+    else if (p.content) content += ` · ${String(p.content).slice(0, 200)}`;
+    else if (p.summary) content += ` · ${p.summary}`;
+  }
+
+  addTimeline({
+    agent: rec.sender,
+    phase: "message",
+    phaseLabel: kindLabel,
+    content,
+    plain: true,
+  });
+}
+
+function addTimeline({ agent, phase, phaseLabel, content, plain, step }) {
+  const t = $("timeline");
+  // 第一次插入时清掉"空状态"提示
+  const emptyEl = t.querySelector(".empty");
+  if (emptyEl) emptyEl.remove();
+
+  const div = document.createElement("div");
+  div.className = "tl-item a-" + (agent || "system");
+
+  const ag = AGENTS[agent] || AGENTS.system;
+  const stepTag = step ? ` <span style="color:var(--fg-faint);font-size:10px;">step ${step}</span>` : "";
+
+  div.innerHTML =
+    `<div class="tl-top">
+       <span class="tl-agent">${esc(ag.label)}</span>
+       <span class="tl-phase ph-${esc(phase)}">${esc(phaseLabel)}</span>${stepTag}
+     </div>
+     <div class="tl-content${plain ? " plain" : ""}">${esc(content)}</div>`;
+
+  // 点击展开/收起长内容
+  div.querySelector(".tl-content").onclick = function () {
+    this.classList.toggle("expanded");
+  };
+
+  t.appendChild(div);
+
+  // 【自动滚到底部】—— 让用户总是看到最新进展。
+  // 但如果用户手动往上滚了（想回看历史），就不要强制拉回来，
+  // 否则会打断阅读。判断方法：看当前是否已经接近底部。
+  const nearBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 120;
+  if (nearBottom) t.scrollTop = t.scrollHeight;
+
+  S.tlCount++;
+  $("tlCount").textContent = S.tlCount;
+}
+
+/* ============================================================================
+   五、RAG 检索细节渲染
+   ============================================================================
+   【这是本项目最有教学价值的面板之一】
+   它把"混合检索"的内部计算完整摊开：
+       两路召回 → RRF 融合 → 阈值剪枝 → 最终排序
+   你能亲眼看到为什么某个块被选中、某个被刷掉。
+   这些信息在普通 RAG 框架里是完全被封装掉的。
+   ============================================================================ */
+const ragBuffers = {};   // query -> {card, stages:[]}
+
+function addRag(rec) {
+  if (S.hideRag) return;
+
+  const q = rec.query;
+  if (!ragBuffers[q]) {
+    ragBuffers[q] = { stages: [], card: null };
+  }
+  const buf = ragBuffers[q];
+  buf.stages.push(rec);
+
+  // 每次有新阶段就整体重绘这张卡片（数据量小，全量重绘最简单可靠）
+  renderRagCard(q, buf);
+}
+
+function renderRagCard(q, buf) {
+  const t = $("timeline");
+
+  // 卡片不存在就创建，并追加到时间线末尾
+  if (!buf.card) {
+    const emptyEl = t.querySelector(".empty");
+    if (emptyEl) emptyEl.remove();
+
+    const card = document.createElement("div");
+    card.className = "rag-card";
+    card.innerHTML =
+      `<div class="rag-head">
+         <span style="color:var(--c-rag);font-weight:700;">🔍 检索</span>
+         <span class="rag-q">"${esc(q)}"</span>
+         <span style="margin-left:auto;color:var(--fg-faint);font-size:11px;">点击展开内部计算</span>
+       </div>
+       <div class="rag-body"></div>`;
+    card.querySelector(".rag-head").onclick = () => card.classList.toggle("open");
+    t.appendChild(card);
+    buf.card = card;
+  }
+
+  const body = buf.card.querySelector(".rag-body");
+  body.innerHTML = buf.stages.map(renderRagStage).join("");
+
+  const nearBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 120;
+  if (nearBottom) t.scrollTop = t.scrollHeight;
+}
+
+function renderRagStage(s) {
+  switch (s.stage) {
+    case "recall": {
+      // 两路召回对比。
+      // 【关键观察点】把两路的块 ID 一对比，你会发现它们并不相同 ——
+      // 稠密能召回用词不同但语义相近的块，BM25 能召回精确匹配术语的块。
+      // 这正是"混合检索优于单一检索"的直接证据。
+      const denseIds = new Set(s.dense.map(d => d.chunk_id));
+      const sparseIds = new Set(s.sparse.map(d => d.chunk_id));
+      const both = [...denseIds].filter(x => sparseIds.has(x)).length;
+
+      const maxD = Math.max(...s.dense.map(d => d.score), 0.0001);
+      const maxS = Math.max(...s.sparse.map(d => d.score), 0.0001);
+
+      return `<div class="stage">
+        <div class="stage-label">① 两路召回</div>
+        <div class="stage-desc">
+          稠密 ${s.dense.length} 条 · BM25 ${s.sparse.length} 条 ·
+          <b style="color:#6ee7a8;">两者都命中的只有 ${both} 条</b>
+          ${both < Math.min(s.dense.length, s.sparse.length)
+            ? "—— 说明两路互补，这正是混合检索的价值" : ""}
+        </div>
+        <div style="margin-top:6px;font-size:10.5px;color:var(--fg-faint);">
+          稠密向量得分（余弦相似度，越高越相似）：
+        </div>
+        ${s.dense.slice(0, 6).map(d => bar(d.chunk_id, d.score / maxD, "bar-dense", d.score.toFixed(4))).join("")}
+        <div style="margin-top:6px;font-size:10.5px;color:var(--fg-faint);">
+          BM25 稀疏得分（关键词匹配强度）：
+        </div>
+        ${s.sparse.slice(0, 6).map(d => bar(d.chunk_id, d.score / maxS, "bar-bm25", d.score.toFixed(2))).join("")}
+      </div>`;
+    }
+
+    case "fuse":
+      return `<div class="stage">
+        <div class="stage-label">② RRF 融合</div>
+        <div class="stage-desc">
+          把两路的【排名】倒数相加（k=60），得到 ${s.fused.length} 条候选。
+          注意 RRF 只看排名、不看分数，所以它无法区分"第一名遥遥领先"和"险胜"。
+        </div>
+      </div>`;
+
+    case "prune": {
+      const th = s.thresholds;
+      return `<div class="stage">
+        <div class="stage-label">③ 双阈值剪枝</div>
+        <div class="stage-desc">
+          绝对门槛 BM25 ≥ ${th["绝对门槛_BM25"]} ｜ 相对门槛 ≥ ${(th["相对门槛"] * 100).toFixed(0)}%
+          （相对本次最高分）
+        </div>
+        <div class="stage-desc" style="margin-top:5px;">
+          <span class="stage-pass">✓ 保留 ${s.kept.length} 条</span>
+          ${s.dropped.length ? ` ｜ <span class="stage-fail">✗ 剪掉 ${s.dropped.length} 条</span>` : ""}
+        </div>
+        ${s.dropped.slice(0, 5).map(d => `
+          <div style="font-size:10.5px;color:#fca5a5;margin:3px 0 0 10px;font-family:var(--mono);">
+            ${esc(d.chunk_id)} — BM25=${d.bm25} ${esc(d.reason)}
+          </div>`).join("")}
+      </div>`;
+    }
+
+    case "gate":
+      // 门槛拦截 —— 这是防幻觉最有效的一道防线，值得突出显示
+      return `<div class="stage" style="border-color:${s.passed ? "#238636" : "#da3633"};">
+        <div class="stage-label">
+          ${s.passed ? "✓" : "✗"} 门槛：${esc(s.gate)}
+        </div>
+        ${s.detail ? `<div class="stage-desc" style="font-family:var(--mono);">
+          ${Object.entries(s.detail).map(([k, v]) => `${esc(k)}=${esc(v)}`).join(" ｜ ")}
+        </div>` : ""}
+        <div class="stage-desc ${s.passed ? "stage-pass" : "stage-fail"}">${esc(s.reason)}</div>
+      </div>`;
+
+    case "final":
+      if (s.empty) {
+        return `<div class="stage"><div class="stage-label stage-fail">✗ 最终：返回 0 条</div>
+          <div class="stage-desc">知识库不覆盖此问题。这是正确行为 —— 宁可说不知道，也不要喂噪音。</div></div>`;
+      }
+      return `<div class="stage">
+        <div class="stage-label stage-pass">④ 最终返回 ${s.hits.length} 条（按 BM25×0.75 + 稠密×0.25 重排）</div>
+        ${s.hits.map(h => `
+          <div class="hit">
+            <div class="hit-top">
+              <span class="hit-id" onclick="showChunk('${esc(h.chunk_id)}')">${esc(h.chunk_id)}</span>
+              <span class="hit-score">综合 ${h.score.toFixed(3)}</span>
+              <span style="color:var(--fg-faint);font-size:10.5px;">BM25 ${h.bm25} ｜ 稠密 ${h.dense}</span>
+            </div>
+            <div class="hit-prev">${esc(h.preview)}</div>
+          </div>`).join("")}
+      </div>`;
+
+    default:
+      return "";
+  }
+}
+
+function bar(name, ratio, cls, valText) {
+  const pct = Math.max(2, Math.min(100, ratio * 100));
+  return `<div class="bar-row">
+    <span class="bar-name" title="${esc(name)}">${esc(name)}</span>
+    <span class="bar-track"><span class="bar-fill ${cls}" style="width:${pct}%"></span></span>
+    <span class="bar-val">${esc(valText)}</span>
+  </div>`;
+}
+
+/* ============================================================================
+   六、黑板数据流渲染
+   ============================================================================
+   黑板是多智能体协作的核心机制：Agent 之间不直接调用，
+   而是把结果写进共享黑板，下游按需读取。
+   这个面板展示"数据如何在槽位间流动、版本如何演进"。
+   ============================================================================ */
+function renderBlackboard(slots) {
+  S.slots = slots;
+  const pane = $("blackboard");
+  const keys = Object.keys(slots);
+
+  if (!keys.length) return;
+
+  $("bbCount").textContent = keys.length;
+
+  // 槽位的展示顺序（按数据流动的自然顺序，而不是字典序）
+  const ORDER = ["user_query", "plan", "evidence", "analysis",
+                 "draft", "critique", "final_report", "revision_history"];
+  const sorted = keys.sort((a, b) => {
+    const ia = ORDER.indexOf(a), ib = ORDER.indexOf(b);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+  });
+
+  const SLOT_DESC = {
+    user_query:       "用户原始问题",
+    plan:             "任务规划与验收标准",
+    evidence:         "调研员收集的带来源证据",
+    analysis:         "分析师的多维度对比结论",
+    draft:            "撰写者的报告草稿",
+    critique:         "审校者的判定与问题清单",
+    final_report:     "最终报告",
+    revision_history: "各轮审校记录",
+  };
+
+  pane.innerHTML = sorted.map(k => {
+    const slot = slots[k];
+    const latest = slot.versions[slot.versions.length - 1];
+    const multi = slot.versions.length > 1;
+
+    return `<div class="bb-card" data-slot="${esc(k)}">
+      <div class="bb-head">
+        <span class="bb-slot">${esc(k)}</span>
+        <span class="bb-ver">v${slot.latest_version}</span>
+        <span style="color:var(--fg-faint);font-size:11px;">${esc(SLOT_DESC[k] || "")}</span>
+        <span class="bb-by">${esc(latest.writer)}</span>
+      </div>
+      <div class="bb-body">${esc(formatValue(latest.value))}</div>
+      ${multi ? `<div class="bb-ver-list">
+        ${slot.versions.map(v => `
+          <div class="bb-ver-item">
+            <span class="bb-ver-tag">v${v.version}</span>
+            <span style="color:var(--fg-faint);">${esc(v.writer)} · ${esc(v.note || "")}</span>
+          </div>`).join("")}
+      </div>` : ""}
+    </div>`;
+  }).join("");
+
+  // 绑定展开/收起
+  pane.querySelectorAll(".bb-head").forEach(h => {
+    h.onclick = () => h.parentElement.classList.toggle("open");
+  });
+
+  // 如果是第一版写入，自动展开，让用户立刻看到内容
+  if (!S._bbAutoExpanded) {
+    S._bbAutoExpanded = {};
+  }
+  sorted.forEach(k => {
+    if (!S._bbAutoExpanded[k]) {
+      S._bbAutoExpanded[k] = true;
+      const card = pane.querySelector(`.bb-card[data-slot="${k}"]`);
+      if (card) card.classList.add("open");
+    }
+  });
+}
+
+/* 把任意值格式化成人类可读的文本 */
+function formatValue(v) {
+  if (v === null || v === undefined) return "(空)";
+  if (typeof v === "string") return v;
+  try {
+    // 如果是 {content, citations} 这种结构，优先显示 content
+    if (typeof v === "object" && !Array.isArray(v)) {
+      if (v.content && typeof v.content === "string") {
+        const cites = v.citations && v.citations.length
+          ? `\n\n[引用 ${v.citations.length} 条] ${v.citations.join(", ")}`
+          : "";
+        return v.content + cites;
+      }
+      if (v.verdict) {
+        return `判定: ${v.verdict}  得分: ${v.score}\n` +
+               `问题: ${(v.issues || []).join(" / ") || "无"}\n` +
+               `建议: ${(v.suggestions || []).join(" / ") || "无"}`;
+      }
+    }
+    return JSON.stringify(v, null, 2);
+  } catch (e) {
+    return String(v);
+  }
+}
+
+/* ============================================================================
+   七、统计与角色卡片
+   ============================================================================ */
+function renderAgentCards(agents) {
+  const chips = $("cfgChips");
+  // 角色卡片插到时间线顶部（作为背景信息）
+  const info = document.createElement("div");
+  info.style.marginBottom = "12px";
+  info.innerHTML = agents.map(a => {
+    const ag = AGENTS[a.name] || AGENTS.system;
+    const tools = a.tools.length
+      ? a.tools.map(t => `<span class="tool-tag">${esc(t)}</span>`).join("")
+      : `<span style="color:var(--fg-faint);">(无工具 · 纯生成)</span>`;
+    return `<div class="agent-card">
+      <div class="agent-name">
+        <span class="dot" style="background:${ag.color};"></span>${esc(ag.label)}
+        <span style="color:var(--fg-faint);font-weight:400;font-size:11px;">${esc(a.name)}</span>
+      </div>
+      <div class="agent-tools">${tools}</div>
+    </div>`;
+  }).join("");
+
+  const t = $("timeline");
+  const emptyEl = t.querySelector(".empty");
+  if (emptyEl) emptyEl.remove();
+  t.insertBefore(info, t.firstChild);
+}
+
+function renderSummary(rec) {
+  setStatus(rec.passed ? "done" : "warn");
+
+  $("reportMeta").textContent =
+    `${rec.rounds} 轮 · ${rec.passed ? "审校通过" : "审校未通过"} · ${rec.messages} 条消息`;
+
+  // 报告
+  const pane = $("reportPane");
+  pane.innerHTML = renderMarkdown(rec.report);
+
+  // 让引用可点击
+  pane.querySelectorAll(".cite").forEach(el => {
+    el.onclick = () => showChunk(el.dataset.cid);
+  });
+
+  // 统计信息插到报告顶部
+  const stats = document.createElement("div");
+  const s = rec.llm_stats || {};
+  stats.innerHTML = `<div class="stats-grid">
+    <div class="stat"><div class="stat-k">迭代轮数</div>
+      <div class="stat-v ${rec.rounds > 1 ? "warn" : ""}">${rec.rounds}</div></div>
+    <div class="stat"><div class="stat-k">审校结果</div>
+      <div class="stat-v ${rec.passed ? "ok" : "bad"}">${rec.passed ? "通过" : "未通过"}</div></div>
+    <div class="stat"><div class="stat-k">黑板消息</div>
+      <div class="stat-v">${rec.messages}</div></div>
+    <div class="stat"><div class="stat-k">LLM 调用</div>
+      <div class="stat-v">${s.calls || "-"}</div></div>
+  </div>`;
+  pane.insertBefore(stats, pane.firstChild);
+
+  // 各轮审校记录
+  if (rec.history && rec.history.length) {
+    const h = document.createElement("div");
+    h.style.cssText = "margin-bottom:12px;font-size:12px;color:var(--fg-dim);";
+    h.innerHTML = `<div style="font-weight:700;margin-bottom:5px;color:var(--fg);">各轮审校记录</div>` +
+      rec.history.map(r => `
+        <div style="padding:3px 0;border-bottom:1px solid var(--border);">
+          第 ${r.round} 轮：
+          <span style="color:${r.verdict === "pass" ? "#6ee7a8" : "#fca5a5"};font-weight:700;">${esc(r.verdict)}</span>
+          （得分 ${esc(r.score)}）
+          ${r.issues && r.issues.length
+            ? `<div style="color:var(--fg-faint);margin-left:14px;">问题：${r.issues.map(esc).join("；")}</div>`
+            : ""}
+        </div>`).join("");
+    pane.insertBefore(h, pane.children[1] || null);
+  }
+}
+
+function addError(rec) {
+  setStatus("error");
+  const pane = $("reportPane");
+  const box = document.createElement("div");
+  box.className = "err-box";
+  box.textContent = "❌ 执行出错：" + rec.message + "\n\n" + (rec.traceback || "");
+  pane.insertBefore(box, pane.firstChild);
+}
+
+/* ============================================================================
+   八、极简 Markdown 渲染
+   ============================================================================
+   【为什么手写一个而不用 marked.js？】
+     1. 离线约束 —— 不能引 CDN
+     2. 需求很小 —— 只需要标题、粗体、列表、表格、代码、引用标记
+     3. 更可控 —— 我能精确决定引用标记 [xxx#N] 怎么变成可点击元素
+
+   【安全说明】所有文本都经过 esc() 转义后才拼进 HTML。
+   这一步不能省 —— 模型输出是不可信文本。
+   ============================================================================ */
+function renderMarkdown(md) {
+  if (!md) return '<div class="empty">(无内容)</div>';
+
+  // 先剥掉 HTML 注释（报告开头的生成信息）
+  let s = md.replace(/<!--[\s\S]*?-->/g, "");
+
+  const lines = s.split("\n");
+  const out = [];
+  let inTable = false, inList = false, inCode = false;
+
+  const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+  const closeTable = () => { if (inTable) { out.push("</table>"); inTable = false; } };
+
+  for (let raw of lines) {
+    const line = raw;
+
+    // 代码块
+    if (line.trim().startsWith("```")) {
+      closeList(); closeTable();
+      if (inCode) { out.push("</code></pre>"); inCode = false; }
+      else { out.push("<pre style='background:var(--bg-raise);padding:9px;border-radius:5px;overflow-x:auto;'><code>"); inCode = true; }
+      continue;
+    }
+    if (inCode) { out.push(esc(line)); continue; }
+
+    // 表格
+    if (/^\s*\|.*\|\s*$/.test(line)) {
+      const cells = line.trim().slice(1, -1).split("|").map(c => c.trim());
+      // 分隔行 |---|---| 跳过
+      if (cells.every(c => /^:?-+:?$/.test(c))) continue;
+      if (!inTable) {
+        closeList();
+        out.push("<table>");
+        inTable = true;
+        out.push("<tr>" + cells.map(c => `<th>${inline(c)}</th>`).join("") + "</tr>");
+      } else {
+        out.push("<tr>" + cells.map(c => `<td>${inline(c)}</td>`).join("") + "</tr>");
+      }
+      continue;
+    } else {
+      closeTable();
+    }
+
+    // 标题
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) {
+      closeList();
+      const lvl = h[1].length;
+      out.push(`<h${lvl}>${inline(h[2])}</h${lvl}>`);
+      continue;
+    }
+
+    // 列表
+    const li = line.match(/^\s*[-*]\s+(.*)$/);
+    const oli = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (li || oli) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push(`<li>${inline((li || oli)[1])}</li>`);
+      continue;
+    }
+    closeList();
+
+    // 空行
+    if (!line.trim()) continue;
+
+    // 普通段落
+    out.push(`<p>${inline(line)}</p>`);
+  }
+
+  closeList(); closeTable();
+  if (inCode) out.push("</code></pre>");
+
+  return `<div class="report">${out.join("\n")}</div>`;
+}
+
+/* 行内元素：粗体、代码、引用标记 */
+function inline(text) {
+  let s = esc(text);
+
+  // 引用标记 [doc_id#N] -> 可点击按钮
+  // 【这一步是整个可视化的点睛之笔】
+  //   它把"报告的引用"和"知识库原文"连起来了。
+  //   点一下就能看到原文，你才能验证：
+  //   这句话真的是从那里来的吗？还是模型编的？
+  //   这正是 RAG 防幻觉链条能被【人工核对】的关键。
+  s = s.replace(/\[([^\[\]#\s]+#\d+)\]/g, (m, cid) => {
+    const valid = S.citations.has(cid) || true;   // 先都当作可点，无效的由后端校验体现
+    return `<span class="cite${valid ? "" : " invalid"}" data-cid="${cid}">${cid}</span>`;
+  });
+
+  // 粗体
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  // 行内代码
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  return s;
+}
+
+/* ============================================================================
+   九、原文弹窗（引用溯源）
+   ============================================================================ */
+async function showChunk(chunkId) {
+  const mask = $("modalMask");
+  $("modalTitle").textContent = "原文 · " + chunkId;
+  $("modalBody").innerHTML = '<div class="empty">加载中…</div>';
+  mask.classList.add("show");
+
+  try {
+    const r = await fetch("/api/chunk/" + encodeURIComponent(chunkId));
+    const d = await r.json();
+
+    if (!d.ok) {
+      // 【引用不存在 —— 这是一个重要信号】
+      //   说明报告引用了知识库里没有的块，也就是"编造引用"。
+      //   界面要明确地把这件事说清楚，而不是简单报个错。
+      $("modalBody").innerHTML =
+        `<div class="err-box">
+           ⚠ 该引用在知识库中不存在：${esc(chunkId)}
+
+           这说明报告引用了不存在的来源 —— 属于"编造引用"。
+           本项目的 Critic 会用程序化校验抓出这种情况并强制打回重做。
+           如果你在最终报告里看到这个提示，说明校验环节被绕过了，
+           需要检查 agents/critic.py 的 programmatic_check。
+         </div>`;
+      return;
+    }
+
+    $("modalBody").innerHTML =
+      `<div class="meta">
+         块 ID: ${esc(d.chunk_id)}<br>
+         文档: ${esc(d.doc_id)} · ${esc(d.title)}<br>
+         位置: 第 ${esc(d.position)} 块
+       </div>${esc(d.text)}`;
+
+  } catch (e) {
+    $("modalBody").innerHTML = `<div class="err-box">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+/* ============================================================================
+   十、状态与交互
+   ============================================================================ */
+function setStatus(state) {
+  const b = $("statusBadge");
+  const MAP = {
+    idle:    ["idle",    "待命"],
+    running: ["running", "执行中"],
+    done:    ["done",    "已完成"],
+    warn:    ["done",    "完成(未通过)"],
+    error:   ["error",   "出错"],
+  };
+  const [cls, label] = MAP[state] || MAP.idle;
+  b.className = "badge " + cls;
+  b.textContent = label;
+
+  S.running = (state === "running");
+  $("btnRun").disabled = S.running;
+  $("btnRun").textContent = S.running ? "执行中…" : "▶ 开始协作";
+}
+
+async function startRun() {
+  const q = $("queryInput").value.trim();
+  if (!q) { alert("请先输入问题"); return; }
+
+  // 清空上一轮
+  clearAll();
+  setStatus("running");
+
+  try {
+    const r = await fetch("/api/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      setStatus("error");
+      alert(d.error || "启动失败");
+    }
+  } catch (e) {
+    setStatus("error");
+    alert("请求失败：" + e.message);
+  }
+}
+
+function clearAll() {
+  $("timeline").innerHTML = '<div class="empty">等待事件…</div>';
+  $("blackboard").innerHTML = '<div class="empty">协作开始后<br>这里显示数据如何在槽位间流动</div>';
+  $("reportPane").innerHTML = '<div class="empty">协作完成后<br>报告显示在这里</div>';
+  $("tlCount").textContent = "0";
+  $("bbCount").textContent = "0";
+  $("reportMeta").textContent = "";
+  S.tlCount = 0;
+  S.currentRound = 0;
+  S._bbAutoExpanded = {};
+  for (const k in ragBuffers) delete ragBuffers[k];
+  window.__pendingRound = null;
+}
+
+/* 绑定事件 */
+$("btnRun").onclick = startRun;
+$("btnClear").onclick = clearAll;
+$("btnCloseModal").onclick = () => $("modalMask").classList.remove("show");
+$("modalMask").onclick = (e) => {
+  // 点遮罩关闭（点内容区不关）
+  if (e.target === $("modalMask")) $("modalMask").classList.remove("show");
+};
+$("btnFilterRag").onclick = function () {
+  S.hideRag = !S.hideRag;
+  this.textContent = S.hideRag ? "显示检索细节" : "隐藏检索细节";
+  // 重新同步可见性：遍历现有卡片
+  document.querySelectorAll(".rag-card").forEach(c => {
+    c.style.display = S.hideRag ? "none" : "";
+  });
+};
+// Ctrl+Enter 快捷启动
+$("queryInput").onkeydown = (e) => {
+  if (e.ctrlKey && e.key === "Enter") startRun();
+};
+
+/* ============================================================================
+   十一、初始化
+   ============================================================================ */
+async function init() {
+  // 拉取配置显示在顶栏
+  try {
+    const r = await fetch("/api/config");
+    const c = await r.json();
+    $("cfgChips").innerHTML = `
+      <span class="chip">LLM <b>${esc(c.llm_mode)}</b></span>
+      <span class="chip">Embedding <b>${esc(c.embedder_mode)}</b>/${c.embedding_dim}d</span>
+      <span class="chip">chunk <b>${c.chunk_size}</b>/${c.chunk_overlap}</span>
+      <span class="chip">top_k <b>${c.retrieval_top_k}</b></span>
+      <span class="chip">返工上限 <b>${c.max_revision_rounds}</b></span>`;
+  } catch (e) {
+    console.warn("配置加载失败", e);
+  }
+
+  // 恢复状态（刷新页面后如果还在跑，按钮状态要正确）
+  try {
+    const r = await fetch("/api/status");
+    const s = await r.json();
+    if (s.running) setStatus("running");
+  } catch (e) { /* 忽略 */ }
+
+  connect();
+}
+
+init();
+</script>
+</body>
+</html>

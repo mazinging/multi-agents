@@ -1,0 +1,10 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.idea/
+
+# 运行日志（每次运行重新生成，且可能记录真实对话）
+trace.jsonl
